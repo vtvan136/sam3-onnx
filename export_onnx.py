@@ -1,373 +1,210 @@
 #!/usr/bin/env python3
 
 import pathlib
-import typing
-
-import imgviz
 import numpy as np
 import onnxruntime
 import PIL.Image
 import torch
+import imgviz
+import gc
 from loguru import logger
-from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
-from torchvision.transforms import v2
 
 from infer_torch import get_replace_freqs_cis
-from sam3.model.sam3_image import Sam3Image  # type: ignore[unresolved-import]
-from sam3.model.sam3_image_processor import (  # type: ignore[unresolved-import]
-    Sam3Processor,
-)
-from sam3.model_builder import build_sam3_image_model  # type: ignore[unresolved-import]
+from sam3.model.sam3_image_processor import Sam3Processor
+from sam3.model_builder import build_sam3_image_model
 
+# Cấu hình thiết bị
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ==========================================
+# 1. WRAPPERS (IMAGE, LANGUAGE, DECODER)
+# ==========================================
 class _ImageEncoder(torch.nn.Module):
-    def __init__(self, processor: Sam3Processor) -> None:
+    def __init__(self, backbone) -> None:
         super().__init__()
-        self._processor: Sam3Processor = processor
-        self._transform = v2.Compose(
-            [
-                # NOTE: Resize in .transform has difference between pytorch and onnx
-                # v2.ToDtype(torch.uint8, scale=True),
-                # v2.Resize(size=(resolution := 1008, resolution)),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
+        self.backbone = backbone
+        self.register_buffer("mean", torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1))
+
+    def forward(self, image: torch.Tensor):
+        x = (image - self.mean) / self.std
+        out = self.backbone._forward_image_no_act_ckpt(x)
+        return (
+            out["vision_pos_enc"][0], out["vision_pos_enc"][1], out["vision_pos_enc"][2],
+            out["backbone_fpn"][0], out["backbone_fpn"][1], out["backbone_fpn"][2]
         )
-
-    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        image = self._transform(image).unsqueeze(0)
-
-        backbone_out = self._processor.model.backbone._forward_image_no_act_ckpt(image)
-        del backbone_out["vision_features"]
-        del backbone_out["sam2_backbone_out"]
-
-        assert len(backbone_out["vision_pos_enc"]) == 3
-        assert len(backbone_out["backbone_fpn"]) == 3
-        return *backbone_out["vision_pos_enc"], *backbone_out["backbone_fpn"]
-
-
-def _export_image_encoder(
-    processor: Sam3Processor, image: PIL.Image.Image
-) -> tuple[list[NDArray], list[NDArray]]:
-    image = image.resize((1008, 1008), resample=PIL.Image.BILINEAR)
-
-    onnx_file: pathlib.Path = pathlib.Path("models/sam3_image_encoder.onnx")
-    if onnx_file.exists():
-        logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
-    else:
-        encoder: _ImageEncoder = _ImageEncoder(processor=processor)
-        input_image: torch.Tensor = v2.functional.to_image(image).to("cuda")
-
-        # with torch.no_grad():
-        #     output = image_backbone(input_image)
-
-        logger.debug("exporting onnx model: {!r}", str(onnx_file))
-        torch.onnx.export(
-            encoder,
-            args=(input_image,),
-            f=onnx_file,
-            input_names=["image"],
-            output_names=[
-                "vision_pos_enc_0",
-                "vision_pos_enc_1",
-                "vision_pos_enc_2",
-                "backbone_fpn_0",
-                "backbone_fpn_1",
-                "backbone_fpn_2",
-            ],
-            opset_version=21,
-            verify=True,
-        )
-        logger.debug("exported onnx model: {!r}", str(onnx_file))
-
-    session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
-    output = session.run(None, {"image": np.asarray(image).transpose(2, 0, 1)})
-    assert all(isinstance(o, np.ndarray) for o in output)
-    output = typing.cast(list[NDArray], output)
-    logger.debug("finished onnx runtime inference")
-
-    vision_pos_enc: list[NDArray] = output[:3]
-    backbone_fpn: list[NDArray] = output[3:]
-    return vision_pos_enc, backbone_fpn
-
 
 class _LanguageEncoder(torch.nn.Module):
-    def __init__(self, processor: Sam3Processor) -> None:
+    def __init__(self, language_model) -> None:
         super().__init__()
-        self._processor: Sam3Processor = processor
+        self.lm = language_model
 
-    def forward(
-        self, tokens: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        model: Sam3Image = self._processor.model
-
-        # VETextEncoder.forward
+    def forward(self, tokens: torch.Tensor):
         text_attention_mask = (tokens != 0).bool()
-        #
-        inputs_embeds = model.backbone.language_backbone.encoder.token_embedding(tokens)
-        _, text_memory = model.backbone.language_backbone.encoder(tokens)
-        #
-        assert text_memory.shape[1] == inputs_embeds.shape[1]
-        text_attention_mask = text_attention_mask.ne(1)
+        _, text_memory = self.lm.encoder(tokens)
         text_memory = text_memory.transpose(0, 1)
-        text_memory_resized = model.backbone.language_backbone.resizer(text_memory)
+        text_memory_resized = self.lm.resizer(text_memory)
+        inputs_embeds = self.lm.encoder.token_embedding(tokens)
         return text_attention_mask, text_memory_resized, inputs_embeds.transpose(0, 1)
 
-
-def _export_language_encoder(processor: Sam3Processor) -> list[NDArray]:
-    tokens = tokenize(texts=["person"], context_length=32)
-
-    onnx_file: pathlib.Path = pathlib.Path("models/sam3_language_encoder.onnx")
-    if onnx_file.exists():
-        logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
-    else:
-        encoder: _LanguageEncoder = _LanguageEncoder(processor=processor)
-        tokens_input: torch.Tensor = torch.from_numpy(tokens).to("cuda")
-
-        # with torch.no_grad():
-        #     output = encoder(tokens=tokens_input)
-
-        logger.debug("exporting onnx model: {!r}", str(onnx_file))
-        torch.onnx.export(
-            encoder,
-            args=(tokens_input,),
-            f=onnx_file,
-            input_names=["tokens"],
-            output_names=["text_attention_mask", "text_memory", "text_embeds"],
-            opset_version=21,
-            verify=True,
-        )
-        logger.debug("exported onnx model: {!r}", str(onnx_file))
-
-    session: onnxruntime.InferenceSession = onnxruntime.InferenceSession(onnx_file)
-    output = session.run(None, {"tokens": tokens})
-    assert all(isinstance(o, np.ndarray) for o in output)
-    output = typing.cast(list[NDArray], output)
-    logger.debug("finished onnx runtime inference")
-
-    return output
-
-
 class _Decoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, model, processor) -> None:
         super().__init__()
-        self._model: Sam3Image = build_sam3_image_model()
-        self._processor: Sam3Processor = Sam3Processor(self._model)
+        self.model = model
+        self.processor = processor
 
-    def forward(
-        self,
-        original_height: torch.Tensor,
-        original_width: torch.Tensor,
-        vision_pos_enc_0: torch.Tensor,
-        vision_pos_enc_1: torch.Tensor,
-        vision_pos_enc_2: torch.Tensor,
-        backbone_fpn_0: torch.Tensor,
-        backbone_fpn_1: torch.Tensor,
-        backbone_fpn_2: torch.Tensor,
-        language_mask: torch.Tensor,
-        language_features: torch.Tensor,
-        language_embeds: torch.Tensor,
-        box_coords: torch.Tensor,
-        box_labels: torch.Tensor,
-        box_masks: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        geometric_prompt = self._processor.model._get_dummy_prompt()
-        geometric_prompt.box_embeddings = box_coords
-        geometric_prompt.box_labels = box_labels
-        geometric_prompt.box_mask = box_masks
+    def forward(self, oh, ow, vpe0, vpe1, vpe2, bfp0, bfp1, bfp2, l_mask, l_feat, l_emb, b_coords, b_labels, b_masks):
+        b_coords = b_coords.to(dtype=bfp0.dtype)
+        geom_prompt = self.model._get_dummy_prompt()
+        geom_prompt.box_embeddings = b_coords
+        geom_prompt.box_labels = b_labels.to(torch.int64)
+        geom_prompt.box_mask = b_masks.to(dtype=bfp0.dtype)
+        
         state = {
-            "original_height": original_height,
-            "original_width": original_width,
+            "original_height": oh.to(torch.int64),
+            "original_width": ow.to(torch.int64),
             "backbone_out": {
-                "vision_pos_enc": [
-                    vision_pos_enc_0,
-                    vision_pos_enc_1,
-                    vision_pos_enc_2,
-                ],
-                "backbone_fpn": [
-                    backbone_fpn_0,
-                    backbone_fpn_1,
-                    backbone_fpn_2,
-                ],
-                "language_mask": language_mask,
-                "language_features": language_features,
-                "language_embeds": language_embeds,
+                "vision_pos_enc": [vpe0, vpe1, vpe2],
+                "backbone_fpn": [bfp0, bfp1, bfp2],
+                "language_mask": l_mask.bool(),
+                "language_features": l_feat,
+                "language_embeds": l_emb,
             },
-            "geometric_prompt": geometric_prompt,
+            "geometric_prompt": geom_prompt,
         }
-        result = self._processor._forward_grounding(state)
-        return result["boxes"], result["scores"], result["masks"]
+        res = self.processor._forward_grounding(state)
+        return res["boxes"], res["scores"], res["masks"]
 
-
-def _export_decoder(
-    original_height: int,
-    original_width: int,
-    vision_pos_enc_0: NDArray,
-    vision_pos_enc_1: NDArray,
-    vision_pos_enc_2: NDArray,
-    backbone_fpn_0: NDArray,
-    backbone_fpn_1: NDArray,
-    backbone_fpn_2: NDArray,
-    language_mask: NDArray,
-    language_features: NDArray,
-    language_embeds: NDArray,
-    box_coords: NDArray,
-    box_labels: NDArray,
-    box_masks: NDArray,
-) -> list[NDArray]:
-    onnx_file: pathlib.Path = pathlib.Path("models/sam3_decoder.onnx")
-    if onnx_file.exists():
-        logger.debug("onnx model already exists, skip export: {!r}", str(onnx_file))
+# ==========================================
+# 2. HELPER FUNCTIONS
+# ==========================================
+def get_session(path, use_gpu=True):
+    options = onnxruntime.SessionOptions()
+    options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    if use_gpu:
+        providers = [('CUDAExecutionProvider', {'device_id': 0, 'arena_extend_strategy': 'kSameAsRequested'}), 'CPUExecutionProvider']
     else:
-        logger.debug("exporting onnx model: {!r}", str(onnx_file))
-        decoder: _Decoder = _Decoder()
+        providers = ['CPUExecutionProvider']
+    return onnxruntime.InferenceSession(str(path), sess_options=options, providers=providers)
 
-        # XXX: this inference is needed to make export work with if-condition with
-        # torch.compiler.is_dynamo_compiling
-        # with torch.no_grad():
-        #     output = decoder(
-        #         original_height=torch.tensor(original_height)[None].to("cuda"),
-        #         original_width=torch.tensor(original_width)[None].to("cuda"),
-        #         vision_pos_enc_0=torch.tensor(vision_pos_enc_0).to("cuda"),
-        #         vision_pos_enc_1=torch.tensor(vision_pos_enc_1).to("cuda"),
-        #         vision_pos_enc_2=torch.tensor(vision_pos_enc_2).to("cuda"),
-        #         backbone_fpn_0=torch.tensor(backbone_fpn_0).to("cuda"),
-        #         backbone_fpn_1=torch.tensor(backbone_fpn_1).to("cuda"),
-        #         backbone_fpn_2=torch.tensor(backbone_fpn_2).to("cuda"),
-        #         language_mask=torch.tensor(language_mask).to("cuda"),
-        #         language_features=torch.tensor(language_features).to("cuda"),
-        #         language_embeds=torch.tensor(language_embeds).to("cuda"),
-        #         box_coords=torch.tensor(box_coords).to("cuda"),
-        #         box_labels=torch.tensor(box_labels).to("cuda"),
-        #     )
+def clear_gpu():
+    gc.collect()
+    torch.cuda.empty_cache()
 
-        torch.onnx.export(
-            decoder,
-            args=(
-                torch.tensor(original_height).to("cuda"),
-                torch.tensor(original_width).to("cuda"),
-                torch.tensor(vision_pos_enc_0).to("cuda"),
-                torch.tensor(vision_pos_enc_1).to("cuda"),
-                torch.tensor(vision_pos_enc_2).to("cuda"),
-                torch.tensor(backbone_fpn_0).to("cuda"),
-                torch.tensor(backbone_fpn_1).to("cuda"),
-                torch.tensor(backbone_fpn_2).to("cuda"),
-                torch.tensor(language_mask).to("cuda"),
-                torch.tensor(language_features).to("cuda"),
-                torch.tensor(language_embeds).to("cuda"),
-                torch.tensor(box_coords).to("cuda"),
-                torch.tensor(box_labels).to("cuda"),
-                torch.tensor(box_masks).to("cuda"),
-            ),
-            f=onnx_file,
-            input_names=[
-                "original_height",
-                "original_width",
-                "vision_pos_enc_0",
-                "vision_pos_enc_1",
-                "vision_pos_enc_2",
-                "backbone_fpn_0",
-                "backbone_fpn_1",
-                "backbone_fpn_2",
-                "language_mask",
-                "language_features",
-                "language_embeds",
-                "box_coords",
-                "box_labels",
-                "box_masks",
-            ],
-            output_names=["boxes", "scores", "masks"],
-            opset_version=21,
-            dynamo=False,
-            verify=True,
+# ==========================================
+# 3. EXPORT & RUN LOGIC
+# ==========================================
+
+def run_image_encoder(processor, image):
+    onnx_path = "models/sam3_image_encoder_fp16.onnx"
+    if not pathlib.Path(onnx_path).exists():
+        logger.info("Exporting Image Encoder (FP16)...")
+        model = _ImageEncoder(processor.model.backbone).to(DEVICE).half().eval()
+        dummy_in = torch.randn(1, 3, 1008, 1008).to(DEVICE).half()
+        torch.onnx.export(model, (dummy_in,), onnx_path, opset_version=17)
+        del model
+        clear_gpu()
+
+    # CHẠY TRÊN CPU ĐỂ TRÁNH LỖI SOFTMAX OOM
+    sess = get_session(onnx_path, use_gpu=False)
+    img_input = (np.asarray(image.resize((1008, 1008))).transpose(2, 0, 1) / 255.0).astype(np.float16)
+    out = sess.run(None, {"image": img_input[None, :]})
+    return out[:3], out[3:]
+
+def run_language_encoder(processor):
+    onnx_path = "models/sam3_language_encoder_fp16.onnx"
+    if not pathlib.Path(onnx_path).exists():
+        logger.info("Exporting Language Encoder...")
+        lm = _LanguageEncoder(processor.model.backbone.language_backbone).to(DEVICE).half().eval()
+        tokens = torch.from_numpy(tokenize(texts=["person"], context_length=32)).to(DEVICE)
+        torch.onnx.export(lm, (tokens,), onnx_path, opset_version=17)
+        del lm
+        clear_gpu()
+
+    sess = get_session(onnx_path, use_gpu=True)
+    tokens = tokenize(texts=["person"], context_length=32).astype(np.int64)
+    return sess.run(None, {"tokens": tokens})
+
+def run_decoder(original_size, v_pos, b_fpn, l_out, boxes_np):
+    onnx_path = "models/sam3_decoder_fp16.onnx"
+    if not pathlib.Path(onnx_path).exists():
+        logger.info("Exporting Decoder...")
+        full_model = build_sam3_image_model().to(DEVICE).half().eval()
+        processor = Sam3Processor(full_model)
+        decoder = _Decoder(full_model, processor).to(DEVICE).half().eval()
+        
+        dummy_args = (
+            torch.tensor([original_size[0]], dtype=torch.float16, device=DEVICE),
+            torch.tensor([original_size[1]], dtype=torch.float16, device=DEVICE),
+            *[torch.from_numpy(x).to(DEVICE).half() for x in v_pos],
+            *[torch.from_numpy(x).to(DEVICE).half() for x in b_fpn],
+            torch.from_numpy(l_out[0]).to(DEVICE).bool(),
+            torch.from_numpy(l_out[1]).to(DEVICE).half(),
+            torch.from_numpy(l_out[2]).to(DEVICE).half(),
+            torch.from_numpy(boxes_np['coords']).to(DEVICE).half(),
+            torch.from_numpy(boxes_np['labels']).to(DEVICE).long(),
+            torch.from_numpy(boxes_np['masks'].astype(np.float32)).to(DEVICE).half(),
         )
-        logger.debug("exported onnx model: {!r}", str(onnx_file))
 
-    session = onnxruntime.InferenceSession(onnx_file)
-    output = session.run(
-        None,
-        {
-            "original_height": np.array(original_height),
-            "original_width": np.array(original_width),
-            # "vision_pos_enc_0": vision_pos_enc_0,
-            # "vision_pos_enc_1": vision_pos_enc_1,
-            "vision_pos_enc_2": vision_pos_enc_2,
-            "backbone_fpn_0": backbone_fpn_0,
-            "backbone_fpn_1": backbone_fpn_1,
-            "backbone_fpn_2": backbone_fpn_2,
-            "language_mask": language_mask,
-            "language_features": language_features,
-            # "language_embeds": language_embeds,
-            "box_coords": box_coords,
-            "box_labels": box_labels,
-            "box_masks": box_masks,
-        },
-    )
-    assert all(isinstance(o, np.ndarray) for o in output)
-    output = typing.cast(list[NDArray], output)
-    logger.debug("decoder onnx runtime inference done")
+        torch.onnx.export(decoder, dummy_args, onnx_path, opset_version=17, do_constant_folding=True)
+        del full_model, processor, decoder
+        clear_gpu()
 
-    return output
+    sess = get_session(onnx_path, use_gpu=True)
+    inputs = {
+        "oh": np.array([original_size[0]], dtype=np.float16),
+        "ow": np.array([original_size[1]], dtype=np.float16),
+        "vpe0": v_pos[0], "vpe1": v_pos[1], "vpe2": v_pos[2],
+        "bfp0": b_fpn[0], "bfp1": b_fpn[1], "bfp2": b_fpn[2],
+        "l_mask": l_out[0].astype(bool), "l_feat": l_out[1], "l_emb": l_out[2],
+        "b_c": boxes_np['coords'].astype(np.float16),
+        "b_l": boxes_np['labels'].astype(np.int64),
+        "b_m": boxes_np['masks'].astype(np.float16),
+    }
+    return sess.run(None, inputs)
 
-
+# ==========================================
+# 4. MAIN
+# ==========================================
 def main():
-    model: Sam3Image = build_sam3_image_model()
-    get_replace_freqs_cis(model)
-    processor: Sam3Processor = Sam3Processor(model)
+    pathlib.Path("models").mkdir(exist_ok=True)
+    
+    # Khởi tạo model PyTorch tạm thời để export
+    raw_model = build_sam3_image_model().to(DEVICE).half().eval()
+    get_replace_freqs_cis(raw_model)
+    processor = Sam3Processor(raw_model)
 
-    image: PIL.Image.Image = PIL.Image.open("images/bus.jpg")
-    # image: PIL.Image.Image = PIL.Image.open("2011_000006.jpg")
+    image = PIL.Image.open("images/bus.jpg")
+    
+    # Bước 1 & 2: Chạy Encoders
+    v_pos, b_fpn = run_image_encoder(processor, image)
+    l_out = run_language_encoder(processor)
 
-    # image_encoder {{
-    # state = processor.set_image(image)
-
-    vision_pos_enc, backbone_fpn = _export_image_encoder(processor, image)
-    # }}
-
-    # language_encoder {{
-    # result = processor.set_text_prompt(prompt="person", state=state)
-
-    language_mask, language_features, language_embeds = _export_language_encoder(
-        processor=processor
+    # Bước 3: Prompt (Box)
+    boxes_data = {
+        'coords': np.array([[[100, 100, 400, 800]]], dtype=np.float32),
+        'labels': np.array([[1]], dtype=np.int64),
+        'masks': np.array([[True]], dtype=np.bool_)
+    }
+    
+    # Bước 4: Chạy Decoder (Sử dụng kết quả từ Encoders)
+    logger.info("Running Decoder Inference...")
+    res_boxes, res_scores, res_masks = run_decoder(
+        (image.height, image.width), v_pos, b_fpn, l_out, boxes_data
     )
-    # }}
 
-    # decoder {{
-    # result = processor._forward_grounding(state)
-    # boxes, scores, masks = result["boxes"], result["scores"], result["masks"]
-
-    box_coords = np.array([[[0.1620, 0.4010, 0.0640, 0.0180]]], dtype=np.float32)
-    box_labels = np.array([[1]], dtype=np.int64)
-    box_masks = np.array([[True]], dtype=np.bool_)
-
-    boxes, scores, masks = _export_decoder(
-        original_height=image.height,
-        original_width=image.width,
-        vision_pos_enc_0=vision_pos_enc[0],
-        vision_pos_enc_1=vision_pos_enc[1],
-        vision_pos_enc_2=vision_pos_enc[2],
-        backbone_fpn_0=backbone_fpn[0],
-        backbone_fpn_1=backbone_fpn[1],
-        backbone_fpn_2=backbone_fpn[2],
-        language_mask=language_mask,
-        language_features=language_features,
-        language_embeds=language_embeds,
-        box_coords=box_coords,
-        box_labels=box_labels,
-        box_masks=box_masks,
-    )
-    # }}
-
+    logger.success("Inference successful!")
+    
+    # Hiển thị kết quả
     viz = imgviz.instances2rgb(
         image=np.asarray(image),
-        masks=masks[:, 0, :, :],
-        bboxes=boxes[:, [1, 0, 3, 2]],
-        labels=np.arange(len(boxes)) + 1,
-        captions=[f"{s:.2f}" for s in scores],
+        masks=res_masks[0].astype(bool),
+        bboxes=res_boxes[0],
+        labels=np.arange(len(res_boxes[0])) + 1,
+        captions=[f"{s:.2f}" for s in res_scores[0]],
     )
     imgviz.io.pil_imshow(viz)
-
 
 if __name__ == "__main__":
     main()

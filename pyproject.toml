@@ -1,11 +1,13 @@
 [project]
 name = "sam3-onnx"
 version = "0.2.0"
-requires-python = ">=3.13"
+requires-python = ">=3.11,<3.12"
+
 dependencies = [
     "imgviz>=1.7.6",
     "loguru>=0.7.3",
     "onnxruntime>=1.23.2",
+    "onnxruntime-gpu>=1.24.1",
     "opencv-python>=4.11.0.86",
     "osam>=0.2.5",
 ]
